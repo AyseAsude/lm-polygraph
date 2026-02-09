@@ -3,6 +3,7 @@ import openai
 import time
 import logging
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dataclasses import asdict, dataclass
 from typing import List, Dict, Optional, Union
@@ -293,6 +294,13 @@ class BlackboxModel(Model):
         default_params = asdict(self.generation_parameters)
         default_params.update(args)
         args = self._validate_args(default_params)
+        max_parallel_requests = args.pop("max_parallel_requests", None)
+        if max_parallel_requests is None:
+            max_parallel_requests = min(8, len(input_texts))
+        else:
+            max_parallel_requests = int(max_parallel_requests)
+            if max_parallel_requests < 1:
+                raise ValueError("max_parallel_requests must be >= 1")
 
         # Check if we're trying to access features that require logprobs support
         if (
@@ -325,20 +333,22 @@ class BlackboxModel(Model):
                 # OpenAI supports returning top logprobs, default to 5
                 logprobs_args["top_logprobs"] = args.pop("top_logprobs", 5)
 
-            for prompt in input_texts:
+            def _prepare_messages(prompt):
                 if isinstance(prompt, str):
                     # If prompt is a string, create a single message with "user" role
-                    messages = [{"role": "user", "content": prompt}]
+                    return [{"role": "user", "content": prompt}]
                 elif isinstance(prompt, list) and all(
                     isinstance(item, dict) for item in prompt
                 ):
                     # If prompt is a list of dictionaries, assume it's already structured as chat
-                    messages = prompt
+                    return prompt
                 else:
                     raise ValueError(
                         "Invalid prompt format. Must be either a string or a list of dictionaries."
                     )
 
+            def _generate_single(index, prompt):
+                messages = _prepare_messages(prompt)
                 retries = 0
                 while True:
                     try:
@@ -357,22 +367,72 @@ class BlackboxModel(Model):
                             continue
 
                 if args.get("n", 1) == 1:
-                    texts.append(response.choices[0].message.content)
+                    text = response.choices[0].message.content
+                    normalized_logprobs = None
+                    token_list = None
+                    has_logprobs = False
                     # Store logprobs if available
                     if return_logprobs and hasattr(response.choices[0], "logprobs"):
+                        has_logprobs = True
                         # Normalize logprobs to OpenAI format (handles Together AI)
                         normalized_logprobs = _normalize_logprobs(response.choices[0].logprobs)
-                        self.logprobs.append(normalized_logprobs)
                         # Extract token information if available
                         if normalized_logprobs is not None and hasattr(normalized_logprobs, "content") and normalized_logprobs.content is not None:
-                            tokens = [item.token for item in normalized_logprobs.content]
-                            self.tokens.append(tokens)
+                            token_list = [item.token for item in normalized_logprobs.content]
                 else:
-                    texts.append([resp.message.content for resp in response.choices])
+                    text = [resp.message.content for resp in response.choices]
+                    normalized_logprobs = None
+                    token_list = None
+                    has_logprobs = False
                     # For multiple returns, we don't collect logprobs for now
 
-                # Store the last response for later use
-                self.last_response = response
+                return index, text, normalized_logprobs, token_list, has_logprobs, response
+
+            indexed_texts = [None] * len(input_texts)
+            indexed_logprobs = [None] * len(input_texts)
+            indexed_tokens = [None] * len(input_texts)
+            indexed_has_logprobs = [False] * len(input_texts)
+            indexed_responses = [None] * len(input_texts)
+            max_workers = min(max_parallel_requests, len(input_texts))
+
+            if max_workers <= 1:
+                for i, prompt in enumerate(input_texts):
+                    idx, text, normalized_logprobs, token_list, has_logprobs, response = _generate_single(i, prompt)
+                    indexed_texts[idx] = text
+                    indexed_logprobs[idx] = normalized_logprobs
+                    indexed_tokens[idx] = token_list
+                    indexed_has_logprobs[idx] = has_logprobs
+                    indexed_responses[idx] = response
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [
+                        executor.submit(_generate_single, i, prompt)
+                        for i, prompt in enumerate(input_texts)
+                    ]
+                    for future in as_completed(futures):
+                        idx, text, normalized_logprobs, token_list, has_logprobs, response = future.result()
+                        indexed_texts[idx] = text
+                        indexed_logprobs[idx] = normalized_logprobs
+                        indexed_tokens[idx] = token_list
+                        indexed_has_logprobs[idx] = has_logprobs
+                        indexed_responses[idx] = response
+
+            texts.extend(indexed_texts)
+
+            if return_logprobs and args.get("n", 1) == 1:
+                for has_logprobs, normalized_logprobs, token_list in zip(
+                    indexed_has_logprobs,
+                    indexed_logprobs,
+                    indexed_tokens,
+                ):
+                    if has_logprobs:
+                        self.logprobs.append(normalized_logprobs)
+                        if token_list is not None:
+                            self.tokens.append(token_list)
+
+            if indexed_responses:
+                # Preserve previous semantics: last response corresponds to last input.
+                self.last_response = indexed_responses[-1]
 
         elif (self.hf_api_token is not None) & (self.model_path is not None):
             for prompt in input_texts:
