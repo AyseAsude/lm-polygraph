@@ -4,7 +4,7 @@ import time
 import logging
 import json
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import List, Dict, Optional, Union
 from abc import abstractmethod, ABC
 from transformers import (
@@ -25,6 +25,76 @@ from lm_polygraph.utils.ensemble_utils.ensemble_generator import EnsembleGenerat
 from lm_polygraph.utils.ensemble_utils.dropout import replace_dropout
 
 log = logging.getLogger("lm_polygraph")
+
+
+@dataclass
+class TopLogprobWrapper:
+    """Wrapper to match OpenAI's TopLogprob structure."""
+    token: str
+    logprob: float
+
+
+@dataclass
+class TokenLogprobWrapper:
+    """Wrapper to match OpenAI's ChatCompletionTokenLogprob structure."""
+    token: str
+    logprob: float
+    top_logprobs: List["TopLogprobWrapper"]
+
+
+@dataclass
+class LogprobsWrapper:
+    """Wrapper to match OpenAI's ChoiceLogprobs structure."""
+    content: List[TokenLogprobWrapper]
+
+
+def _normalize_logprobs(logprobs_obj):
+    """
+    Convert Together AI logprobs format to OpenAI-compatible format.
+
+    Together AI format:
+        - content: None
+        - tokens: ['The', ' city', ...]
+        - token_logprobs: [-0.026, -0.0002, ...]
+        - top_logprobs: [{'The': -0.026, 'New': -3.65}, ...]
+
+    OpenAI format:
+        - content: [TokenLogprobWrapper(...), ...]
+    """
+    if logprobs_obj is None:
+        return None
+
+    # Already OpenAI format - content is a non-None list
+    if hasattr(logprobs_obj, "content") and logprobs_obj.content is not None:
+        return logprobs_obj
+
+    # Together AI format - convert to OpenAI format
+    if hasattr(logprobs_obj, "tokens") and logprobs_obj.tokens is not None:
+        content = []
+        tokens = logprobs_obj.tokens
+        token_logprobs = logprobs_obj.token_logprobs or []
+        top_logprobs_list = getattr(logprobs_obj, "top_logprobs", None) or []
+
+        for i, token in enumerate(tokens):
+            # Get logprob for this token (default to 0.0 if missing)
+            logprob = token_logprobs[i] if i < len(token_logprobs) else 0.0
+
+            # Convert top_logprobs dict to list of TopLogprobWrapper
+            top_lps = []
+            if i < len(top_logprobs_list) and top_logprobs_list[i]:
+                for t, lp in top_logprobs_list[i].items():
+                    top_lps.append(TopLogprobWrapper(token=t, logprob=lp))
+
+            content.append(TokenLogprobWrapper(
+                token=token,
+                logprob=logprob,
+                top_logprobs=top_lps
+            ))
+
+        return LogprobsWrapper(content=content)
+
+    # Unknown format - return as-is
+    return logprobs_obj
 
 
 class Model(ABC):
@@ -102,6 +172,7 @@ class BlackboxModel(Model):
         hf_api_token: str = None,
         generation_parameters: GenerationParameters = GenerationParameters(),
         supports_logprobs: bool = False,
+        base_url: str = None,
     ):
         """
         Parameters:
@@ -111,6 +182,8 @@ class BlackboxModel(Model):
             hf_api_token (Optional[str]): Huggingface API token if the blackbox model comes from HF. Default: None.
             generation_parameters (GenerationParameters): parameters to use in model generation. Default: default parameters.
             supports_logprobs (bool): Whether the model supports returning log probabilities. Default: False.
+            base_url (Optional[str]): Base URL for OpenAI-compatible API providers. If None, uses the default
+                OpenAI API endpoint. Default: None.
         """
         super().__init__(model_path, "Blackbox")
         self.generation_parameters = generation_parameters
@@ -118,7 +191,7 @@ class BlackboxModel(Model):
         self.supports_logprobs = supports_logprobs
 
         if openai_api_key is not None:
-            self.openai_api = openai.OpenAI(api_key=openai_api_key)
+            self.openai_api = openai.OpenAI(api_key=openai_api_key, base_url=base_url)
 
         self.hf_api_token = hf_api_token
 
@@ -186,7 +259,7 @@ class BlackboxModel(Model):
 
     @staticmethod
     def from_openai(
-        openai_api_key: str, model_path: str, supports_logprobs: bool = False, **kwargs
+        openai_api_key: str, model_path: str, supports_logprobs: bool = False, base_url: str = None, **kwargs
     ):
         """
         Initializes a blackbox model from OpenAI API.
@@ -204,6 +277,7 @@ class BlackboxModel(Model):
             model_path=model_path,
             supports_logprobs=supports_logprobs,
             generation_parameters=generation_parameters,
+            base_url=base_url,
         )
 
     def generate_texts(self, input_texts: List[str], **args) -> List[str]:
@@ -286,13 +360,12 @@ class BlackboxModel(Model):
                     texts.append(response.choices[0].message.content)
                     # Store logprobs if available
                     if return_logprobs and hasattr(response.choices[0], "logprobs"):
-                        self.logprobs.append(response.choices[0].logprobs)
+                        # Normalize logprobs to OpenAI format (handles Together AI)
+                        normalized_logprobs = _normalize_logprobs(response.choices[0].logprobs)
+                        self.logprobs.append(normalized_logprobs)
                         # Extract token information if available
-                        if hasattr(response.choices[0].logprobs, "content"):
-                            tokens = [
-                                item.token
-                                for item in response.choices[0].logprobs.content
-                            ]
+                        if normalized_logprobs is not None and hasattr(normalized_logprobs, "content") and normalized_logprobs.content is not None:
+                            tokens = [item.token for item in normalized_logprobs.content]
                             self.tokens.append(tokens)
                 else:
                     texts.append([resp.message.content for resp in response.choices])
