@@ -138,7 +138,7 @@ class SamplingPromptCalculator(BasePromptCalculator):
     def __init__(self):
         super().__init__(
             "Question: {q}\n Here are some ideas that were brainstormed: {s}\n Possible answer:{a}\n "
-            "Is the possible answer:\n (A) True\n (B) False\n The possible answer is:",
+            "Is the possible answer:\n True or False\n The possible answer is:",
             "True",
             "p_true_sampling",
             sample_text_dependency="sample_texts",
