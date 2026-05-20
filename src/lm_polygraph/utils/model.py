@@ -1,6 +1,7 @@
 import torch
 import openai
 import time
+import random
 import logging
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,6 +48,29 @@ class TokenLogprobWrapper:
 class LogprobsWrapper:
     """Wrapper to match OpenAI's ChoiceLogprobs structure."""
     content: List[TokenLogprobWrapper]
+
+
+# Transient errors worth retrying. Other API errors (auth, bad request)
+# propagate immediately so we fail fast on real problems.
+_RETRYABLE_API_EXCEPTIONS = (
+    openai.RateLimitError,
+    openai.InternalServerError,
+    openai.APIConnectionError,
+    openai.APITimeoutError,
+)
+
+
+def _retry_delay_seconds(exception, attempt: int) -> float:
+    """Honor the provider's Retry-After header if present, else exponential backoff with jitter."""
+    response = getattr(exception, "response", None)
+    if response is not None:
+        retry_after = response.headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                return float(retry_after)
+            except (TypeError, ValueError):
+                pass
+    return min(2 ** attempt, 30.0) + random.uniform(0, 1)
 
 
 def _normalize_logprobs(logprobs_obj):
@@ -310,7 +334,7 @@ class BlackboxModel(Model):
         args = self._validate_args(default_params)
         max_parallel_requests = args.pop("max_parallel_requests", None)
         if max_parallel_requests is None:
-            max_parallel_requests = min(8, len(input_texts))
+            max_parallel_requests = min(2, len(input_texts))
         else:
             max_parallel_requests = int(max_parallel_requests)
             if max_parallel_requests < 1:
@@ -363,8 +387,8 @@ class BlackboxModel(Model):
 
             def _generate_single(index, prompt):
                 messages = _prepare_messages(prompt)
-                retries = 0
-                while True:
+                max_retries = 5
+                for attempt in range(max_retries + 1):
                     try:
                         response = self.openai_api.chat.completions.create(
                             model=self.model_path,
@@ -373,12 +397,15 @@ class BlackboxModel(Model):
                             **logprobs_args,
                         )
                         break
-                    except Exception as e:
-                        if retries > 4:
-                            raise Exception from e
-                        else:
-                            retries += 1
-                            continue
+                    except _RETRYABLE_API_EXCEPTIONS as e:
+                        if attempt >= max_retries:
+                            raise
+                        delay = _retry_delay_seconds(e, attempt)
+                        log.warning(
+                            "API request failed (%s), retrying in %.1fs (attempt %d/%d)",
+                            type(e).__name__, delay, attempt + 1, max_retries,
+                        )
+                        time.sleep(delay)
 
                 if args.get("n", 1) == 1:
                     text = response.choices[0].message.content
