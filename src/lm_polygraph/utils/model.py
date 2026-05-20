@@ -190,6 +190,7 @@ class BlackboxModel(Model):
         self.generation_parameters = generation_parameters
         self.openai_api_key = openai_api_key
         self.supports_logprobs = supports_logprobs
+        self.base_url = base_url
 
         if openai_api_key is not None:
             self.openai_api = openai.OpenAI(api_key=openai_api_key, base_url=base_url)
@@ -208,6 +209,16 @@ class BlackboxModel(Model):
         """
         args_copy = args.copy()
 
+        # When pointed at an OpenAI-compatible provider (e.g. Together AI),
+        # forward provider-specific params via the SDK's extra_body escape hatch
+        # so they survive the SDK's typed signature check.
+        passthrough_for_custom_base_url = ["repetition_penalty", "top_k"]
+        extra_body = {}
+        if self.base_url is not None:
+            for key in passthrough_for_custom_base_url:
+                if key in args_copy and args_copy[key] is not None:
+                    extra_body[key] = args_copy.pop(key)
+
         # BlackboxModel specific validation
         for delete_key in [
             "do_sample",
@@ -220,6 +231,9 @@ class BlackboxModel(Model):
             "stop_strings",
         ]:
             args_copy.pop(delete_key, None)
+
+        if extra_body:
+            args_copy["extra_body"] = extra_body
 
         # Map HF argument names to OpenAI/HF API argument names
         key_mapping = {
