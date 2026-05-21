@@ -73,6 +73,66 @@ def _retry_delay_seconds(exception, attempt: int) -> float:
     return min(2 ** attempt, 30.0) + random.uniform(0, 1)
 
 
+def _is_harmony_format_model(model_path: Optional[str]) -> bool:
+    """Detect Harmony-format reasoning models (OpenAI gpt-oss family) by name."""
+    if model_path is None:
+        return False
+    return "gpt-oss" in model_path.lower()
+
+
+def _filter_harmony_final_channel(logprobs_obj):
+    """
+    Slice Harmony-format logprobs down to the `final` answer channel.
+
+    Harmony-format reasoning models (e.g. gpt-oss) emit logprobs spanning both
+    the `analysis` chain-of-thought channel and the `final` answer channel,
+    separated by special tokens: ``<|channel|> analysis <|message|> ... <|end|>
+    <|start|> assistant <|channel|> final <|message|> ... <|return|>``. The
+    visible ``message.content`` is the final channel only, so by default the
+    stored logprobs and the answer text are out of sync and UE estimators
+    score the CoT + special tokens instead of the answer.
+
+    Keeps tokens between ``<|channel|> final <|message|>`` and the terminating
+    ``<|return|>`` / ``<|end|>``. If markers aren't found, returns the input
+    unchanged and warns.
+    """
+    if (
+        logprobs_obj is None
+        or not hasattr(logprobs_obj, "content")
+        or logprobs_obj.content is None
+    ):
+        return logprobs_obj
+
+    content = logprobs_obj.content
+    tokens = [item.token for item in content]
+
+    start_idx = None
+    for i in range(len(tokens) - 2):
+        if (
+            tokens[i] == "<|channel|>"
+            and tokens[i + 1].strip() == "final"
+            and tokens[i + 2] == "<|message|>"
+        ):
+            start_idx = i + 3
+            break
+
+    if start_idx is None:
+        log.warning(
+            "Harmony filter: '<|channel|> final <|message|>' marker not found "
+            "in %d-token logprobs stream; returning unfiltered logprobs.",
+            len(tokens),
+        )
+        return logprobs_obj
+
+    end_idx = len(content)
+    for j in range(start_idx, len(tokens)):
+        if tokens[j] in ("<|return|>", "<|end|>"):
+            end_idx = j
+            break
+
+    return LogprobsWrapper(content=content[start_idx:end_idx])
+
+
 def _normalize_logprobs(logprobs_obj):
     """
     Convert Together AI logprobs format to OpenAI-compatible format.
@@ -417,6 +477,10 @@ class BlackboxModel(Model):
                         has_logprobs = True
                         # Normalize logprobs to OpenAI format (handles Together AI)
                         normalized_logprobs = _normalize_logprobs(response.choices[0].logprobs)
+                        # For Harmony-format reasoning models (gpt-oss), strip
+                        # CoT + special tokens so logprobs align with message.content.
+                        if _is_harmony_format_model(self.model_path):
+                            normalized_logprobs = _filter_harmony_final_channel(normalized_logprobs)
                         # Extract token information if available
                         if normalized_logprobs is not None and hasattr(normalized_logprobs, "content") and normalized_logprobs.content is not None:
                             token_list = [item.token for item in normalized_logprobs.content]
