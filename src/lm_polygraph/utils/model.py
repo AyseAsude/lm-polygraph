@@ -73,6 +73,15 @@ def _retry_delay_seconds(exception, attempt: int) -> float:
     return min(2 ** attempt, 30.0) + random.uniform(0, 1)
 
 
+def _is_invalid_n_error(exception) -> bool:
+    """Match providers that reject n>1 (e.g. DeepSeek: 'Invalid n value (currently only n = 1 is supported)')."""
+    if not isinstance(exception, openai.BadRequestError):
+        return False
+    message = str(getattr(exception, "message", "") or exception)
+    lowered = message.lower()
+    return "invalid n value" in lowered or "only n = 1" in lowered or "only n=1" in lowered
+
+
 def _is_harmony_format_model(model_path: Optional[str]) -> bool:
     """Detect Harmony-format reasoning models (OpenAI gpt-oss family) by name."""
     if model_path is None:
@@ -281,6 +290,11 @@ class BlackboxModel(Model):
 
         self.hf_api_token = hf_api_token
 
+        # Tri-state cache for whether the provider accepts n>1 in chat.completions.create.
+        # None = unknown, True = native n>1 works, False = must emulate via parallel n=1 calls.
+        # Some OpenAI-compatible providers (e.g. DeepSeek) only support n=1.
+        self._server_supports_n: Optional[bool] = None
+
     def _validate_args(self, args):
         """
         Validates and adapts arguments for BlackboxModel generation.
@@ -445,15 +459,18 @@ class BlackboxModel(Model):
                         "Invalid prompt format. Must be either a string or a list of dictionaries."
                     )
 
-            def _generate_single(index, prompt):
+            def _generate_single(index, prompt, use_n=None):
+                """One chat.completions.create call. If use_n is given, it overrides args['n']."""
                 messages = _prepare_messages(prompt)
+                call_args = args if use_n is None else {**args, "n": use_n}
+                effective_n = call_args.get("n", 1)
                 max_retries = 5
                 for attempt in range(max_retries + 1):
                     try:
                         response = self.openai_api.chat.completions.create(
                             model=self.model_path,
                             messages=messages,
-                            **args,
+                            **call_args,
                             **logprobs_args,
                         )
                         break
@@ -467,7 +484,7 @@ class BlackboxModel(Model):
                         )
                         time.sleep(delay)
 
-                if args.get("n", 1) == 1:
+                if effective_n == 1:
                     text = response.choices[0].message.content
                     normalized_logprobs = None
                     token_list = None
@@ -493,34 +510,120 @@ class BlackboxModel(Model):
 
                 return index, text, normalized_logprobs, token_list, has_logprobs, response
 
+            requested_n = int(args.get("n", 1) or 1)
+
             indexed_texts = [None] * len(input_texts)
             indexed_logprobs = [None] * len(input_texts)
             indexed_tokens = [None] * len(input_texts)
             indexed_has_logprobs = [False] * len(input_texts)
             indexed_responses = [None] * len(input_texts)
-            max_workers = min(max_parallel_requests, len(input_texts))
 
-            if max_workers <= 1:
-                for i, prompt in enumerate(input_texts):
-                    idx, text, normalized_logprobs, token_list, has_logprobs, response = _generate_single(i, prompt)
-                    indexed_texts[idx] = text
-                    indexed_logprobs[idx] = normalized_logprobs
-                    indexed_tokens[idx] = token_list
-                    indexed_has_logprobs[idx] = has_logprobs
-                    indexed_responses[idx] = response
-            else:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = [
-                        executor.submit(_generate_single, i, prompt)
-                        for i, prompt in enumerate(input_texts)
-                    ]
-                    for future in as_completed(futures):
-                        idx, text, normalized_logprobs, token_list, has_logprobs, response = future.result()
+            # If we already learned this provider rejects n>1, skip the native attempt.
+            needs_emulation = requested_n > 1 and self._server_supports_n is False
+
+            if not needs_emulation:
+                max_workers = min(max_parallel_requests, len(input_texts))
+                invalid_n_detected = False
+                successful = []
+
+                if max_workers <= 1:
+                    for i, prompt in enumerate(input_texts):
+                        try:
+                            successful.append(_generate_single(i, prompt))
+                        except openai.BadRequestError as e:
+                            if requested_n > 1 and _is_invalid_n_error(e):
+                                invalid_n_detected = True
+                                break
+                            raise
+                else:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [
+                            executor.submit(_generate_single, i, prompt)
+                            for i, prompt in enumerate(input_texts)
+                        ]
+                        for future in as_completed(futures):
+                            try:
+                                successful.append(future.result())
+                            except openai.BadRequestError as e:
+                                if requested_n > 1 and _is_invalid_n_error(e):
+                                    invalid_n_detected = True
+                                    # Other in-flight futures may also fail with the same
+                                    # error; drain them rather than cancelling so the pool
+                                    # shuts down cleanly. Their results are discarded.
+                                else:
+                                    raise
+
+                if invalid_n_detected:
+                    self._server_supports_n = False
+                    log.warning(
+                        "Provider rejected n=%d on chat.completions; falling back to %d parallel "
+                        "n=1 requests for this BlackboxModel.",
+                        requested_n, requested_n,
+                    )
+                    needs_emulation = True
+                else:
+                    if requested_n > 1:
+                        self._server_supports_n = True
+                    for idx, text, normalized_logprobs, token_list, has_logprobs, response in successful:
                         indexed_texts[idx] = text
                         indexed_logprobs[idx] = normalized_logprobs
                         indexed_tokens[idx] = token_list
                         indexed_has_logprobs[idx] = has_logprobs
                         indexed_responses[idx] = response
+
+            if needs_emulation:
+                # Emulate n>1 by issuing N parallel n=1 requests per prompt.
+                work_units = [
+                    (i, j, prompt)
+                    for i, prompt in enumerate(input_texts)
+                    for j in range(requested_n)
+                ]
+                indexed_texts = [[None] * requested_n for _ in input_texts]
+                indexed_responses = [None] * len(input_texts)
+
+                log.info(
+                    "n>1 emulation: dispatching %d n=1 requests (%d prompts x %d samples)",
+                    len(work_units), len(input_texts), requested_n,
+                )
+
+                def _run_emulated(unit):
+                    i, j, prompt = unit
+                    return i, j, _generate_single(i, prompt, use_n=1)
+
+                max_workers = min(max_parallel_requests, len(work_units))
+                if max_workers <= 1:
+                    for unit in work_units:
+                        i, j, result = _run_emulated(unit)
+                        _, text, _, _, _, response = result
+                        indexed_texts[i][j] = text
+                        indexed_responses[i] = response
+                else:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [executor.submit(_run_emulated, unit) for unit in work_units]
+                        for future in as_completed(futures):
+                            i, j, result = future.result()
+                            _, text, _, _, _, response = result
+                            indexed_texts[i][j] = text
+                            indexed_responses[i] = response
+
+                # Sanity check: every prompt must have all K slots filled. If any slot
+                # is None, something dropped a future silently — surface it loudly.
+                sample_counts = [sum(1 for s in row if s is not None) for row in indexed_texts]
+                if any(c != requested_n for c in sample_counts):
+                    log.warning(
+                        "n>1 emulation: per-prompt sample counts %s (expected all %d)",
+                        sample_counts, requested_n,
+                    )
+                else:
+                    log.info(
+                        "n>1 emulation: complete — %d samples per prompt for %d prompts",
+                        requested_n, len(input_texts),
+                    )
+
+                # Match the existing n>1 contract: no per-call logprobs collected.
+                indexed_logprobs = [None] * len(input_texts)
+                indexed_tokens = [None] * len(input_texts)
+                indexed_has_logprobs = [False] * len(input_texts)
 
             texts.extend(indexed_texts)
 
