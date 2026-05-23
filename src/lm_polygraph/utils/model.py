@@ -73,6 +73,24 @@ def _retry_delay_seconds(exception, attempt: int) -> float:
     return min(2 ** attempt, 30.0) + random.uniform(0, 1)
 
 
+def _response_is_empty(response, effective_n: int) -> bool:
+    """Detect responses with no usable content so the caller can retry.
+
+    For n=1 we trigger on a None/empty single choice. For n>1 we only treat the
+    whole response as empty when *every* choice is empty — partial responses
+    are kept.
+    """
+    if response is None or not getattr(response, "choices", None):
+        return True
+    if effective_n == 1:
+        text = response.choices[0].message.content
+        return text is None or text == ""
+    return all(
+        (c.message.content is None or c.message.content == "")
+        for c in response.choices
+    )
+
+
 def _is_invalid_n_error(exception) -> bool:
     """Match providers that reject n>1 (e.g. DeepSeek: 'Invalid n value (currently only n = 1 is supported)')."""
     if not isinstance(exception, openai.BadRequestError):
@@ -473,7 +491,6 @@ class BlackboxModel(Model):
                             **call_args,
                             **logprobs_args,
                         )
-                        break
                     except _RETRYABLE_API_EXCEPTIONS as e:
                         if attempt >= max_retries:
                             raise
@@ -483,6 +500,29 @@ class BlackboxModel(Model):
                             type(e).__name__, delay, attempt + 1, max_retries,
                         )
                         time.sleep(delay)
+                        continue
+
+                    # Retry when the provider returns no usable content (e.g. DeepSeek
+                    # occasionally returns null/empty message.content). For n>1, retry
+                    # only if every choice is empty; partial responses are kept and
+                    # the empty samples are filtered later at consolidation.
+                    if _response_is_empty(response, effective_n):
+                        if attempt >= max_retries:
+                            log.warning(
+                                "Provider returned empty content after %d retries "
+                                "for prompt index %d; dropping at consolidation.",
+                                max_retries, index,
+                            )
+                            break
+                        delay = min(2 ** attempt, 30.0) + random.uniform(0, 1)
+                        log.warning(
+                            "Provider returned empty content, retrying in %.1fs (attempt %d/%d)",
+                            delay, attempt + 1, max_retries,
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    break
 
                 if effective_n == 1:
                     text = response.choices[0].message.content
