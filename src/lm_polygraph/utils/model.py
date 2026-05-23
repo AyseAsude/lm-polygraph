@@ -590,7 +590,9 @@ class BlackboxModel(Model):
                     i, j, prompt = unit
                     return i, j, _generate_single(i, prompt, use_n=1)
 
-                max_workers = min(max_parallel_requests, len(work_units))
+                # Scale concurrency by requested_n so per-prompt parallelism matches
+                # the native n>1 path (where one request returns N samples in parallel).
+                max_workers = min(max_parallel_requests * requested_n, len(work_units))
                 if max_workers <= 1:
                     for unit in work_units:
                         i, j, result = _run_emulated(unit)
